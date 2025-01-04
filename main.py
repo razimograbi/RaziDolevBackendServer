@@ -25,7 +25,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # adjust in production
+    allow_origins=["*"],  # will adjust it in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,10 +44,12 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         # Maps user_id to call_id if the user is currently in a call
         self.user_call_map: Dict[str, str] = {}
+        self.user_language: Dict[str, str] = {}
 
     async def connect(self, user_id: str, websocket: WebSocket):
         # await websocket.accept()
         self.active_connections[user_id] = websocket
+        # self.user_language[user_id] = language
 
     def disconnect(self, user_id: str):
         if user_id in self.active_connections:
@@ -333,6 +335,7 @@ class WebSocketConnection(WebSocketEndpoint):
                 return
             # print("it worked!")
             self.user_id = init_msg["user_id"]
+            # self.language = init_msg["language"]
             await manager.connect(self.user_id, websocket)
         except Exception:
             await websocket.close(code=4001)
@@ -342,7 +345,7 @@ class WebSocketConnection(WebSocketEndpoint):
 
     async def on_receive(self, websocket: StarletteWebSocket, data):
         if isinstance(data, str):
-            # It's a metadata message
+            # Its a metadata message
             try:
                 parsed_data = json.loads(data)
             except json.JSONDecodeError:
@@ -365,22 +368,23 @@ class WebSocketConnection(WebSocketEndpoint):
 
             self.current_metadata = parsed_data
 
+        elif isinstance(data, bytes):
+            # print("Recieved JSON as bytes\n")
+            if not self.current_metadata:
+                await websocket.send_text("No metadata for this binary frame.")
+                return
+            await self.on_receive_binary(data)
+
         else:
-            print("Recieved JSON as bytes, we cannot handle that!\n")
-            # Unexpected: we do not handle JSON as bytes here
-            # Binary frames should be handled by on_receive_binary
-            pass
+            print("recieved something non familiar, doing nothing !!!!\n")
 
-    async def on_receive_binary(self, websocket: StarletteWebSocket, data: bytes):
-        if not self.current_metadata:
-            await websocket.send_text("No metadata for this binary frame.")
-            return
 
+    async def on_receive_binary(self, data: bytes):
         meta = self.current_metadata
         call_id = meta["call_id"]
         seq_num = int(meta["seq_num"])
 
-        await store_audio_chunk(call_id, self.user_id, data)
+        # await store_audio_chunk(call_id, self.user_id, data)
         await increment_sequence_number(call_id, self.user_id)
 
         # Forward the chunk to the other participant
