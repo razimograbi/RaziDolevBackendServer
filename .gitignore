@@ -1,0 +1,33 @@
+# Ignore virtual environment folder
+venv/
+
+XTTS_Packages/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore environment files
+*.env
+environment.env
+
+# Ignore audio files (if needed)
+*.wav
+*.mp3
+
+# Ignore log files
+*.log
+
+# Ignore generated files
+output.wav
+record_out.wav
+generated_arabic_speech.wav
+
+# Ignore IDE-specific files
+.idea/
+*.iml
+
+# Ignore temporary files
+*.tmp
+.DS_Store

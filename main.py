@@ -1,18 +1,53 @@
-import asyncio
+# import asyncio
+# uvicorn main:app --host 0.0.0.0 --port 8000 --env-file environment.env
 import json
 import time
+import json
 import uuid
 from typing import Optional, Dict, Any
+from asyncio import Lock
 
 import aioredis
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status, Body
+from fastapi import FastAPI, WebSocket, File, UploadFile, WebSocketDisconnect, HTTPException, status, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.endpoints import WebSocketEndpoint
 from starlette.websockets import WebSocket as StarletteWebSocket
 from starlette.routing import Route, WebSocketRoute
 from starlette.middleware.cors import CORSMiddleware
+from audioAccumulator import AudioAccumulator
+from externalAPIs import Whisper, ChatGpt, TTS
+import io
+from pydub import AudioSegment
 
+# from TTS.tts.configs.xtts_config import XttsConfig
+# from TTS.tts.models.xtts import Xtts
+import tempfile
+
+# import numpy as np
+
+"""
+This is for testing
+
+"""
+import torch
+#
+print(torch.cuda.is_available())  # Should return True if GPU is detected
+
+# config = XttsConfig()
+# config.load_json("./XTTS_Packages/XTTS-v2/config.json")
+#
+# model = Xtts.init_from_config(config)
+# model.load_checkpoint(config, checkpoint_dir="./XTTS_Packages/XTTS-v2/")
+# model.cpu()  # we will use  model.cpu() bec the device has a weak GPU
+
+from user import User
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ==========================
 # Configuration and Globals
@@ -20,6 +55,8 @@ from starlette.middleware.cors import CORSMiddleware
 
 REDIS_URL = "redis://localhost:6379"
 redis_pool = None
+audio_accumulators = {}
+audio_accumulators_locks = {}
 
 app = FastAPI()
 
@@ -36,39 +73,74 @@ app.add_middleware(
 # Utility Classes & Functions
 # ==========================
 
+
 class ConnectionManager:
     """
     Manages WebSocket connections by user_id, plus tracks call involvement.
     """
+
     def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
+        self.active_users: Dict[str, User] = {}
         # Maps user_id to call_id if the user is currently in a call
         self.user_call_map: Dict[str, str] = {}
-        self.user_language: Dict[str, str] = {}
 
-    async def connect(self, user_id: str, websocket: WebSocket):
-        # await websocket.accept()
-        self.active_connections[user_id] = websocket
-        # self.user_language[user_id] = language
+    async def connect(
+            self,
+            user_id: str,
+            websocket: WebSocket,
+            language: str = "en",
+            profile_name: str = "",
+            email: str = "",
+            embedding=None,
+            gpt_cond_latent=None
+    ):
+        """
+            If user_id already connected, close the old connection and replace it.
+        """
+        if user_id in self.active_users:
+            old_user = self.active_users[user_id]
+            # await old_user.websocket.close()
+            old_user.websocket = websocket
+            print(" I am here\n")
+            return
+
+        user = User(
+            websocket=websocket,
+            user_id=user_id,
+            language=language,
+            profile_name=profile_name,
+            email=email,
+            embedding=embedding,
+            gpt_cond_latent=gpt_cond_latent
+        )
+        self.active_users[user_id] = user
 
     def disconnect(self, user_id: str):
-        if user_id in self.active_connections:
-            del self.active_connections[user_id]
+        """
+            Remove from active_users and user_call_map.
+        """
+        if user_id in self.active_users:
+            del self.active_users[user_id]
+
         if user_id in self.user_call_map:
             del self.user_call_map[user_id]
 
     async def send_json(self, user_id: str, data: Any):
-        if user_id in self.active_connections:
-            conn = self.active_connections[user_id]
-            await conn.send_json(data)
+        """
+            Sends JSON to the specified user's websocket if available.
+        """
+        if user_id in self.active_users:
+            user = self.active_users[user_id]
+            await user.websocket.send_json(data)
 
     async def send_bytes(self, user_id: str, data: bytes):
-        if user_id in self.active_connections:
-            conn = self.active_connections[user_id]
-            await conn.send_bytes(data)
+        if user_id in self.active_users:
+            user = self.active_users[user_id]
+            await user.websocket.send_bytes(data)
 
     def is_user_online(self, user_id: str) -> bool:
-        return user_id in self.active_connections
+        # print(self.active_users)
+        return user_id in self.active_users
 
     def set_user_call(self, user_id: str, call_id: str):
         self.user_call_map[user_id] = call_id
@@ -77,11 +149,41 @@ class ConnectionManager:
         return self.user_call_map.get(user_id)
 
     def remove_call(self, call_id: str, caller_id: str, receiver_id: str):
+        """
+            Remove the call_id from user_call_map for these participants
+        """
         # Remove the call_id from user_call_map for these participants
         if self.user_call_map.get(caller_id) == call_id:
             del self.user_call_map[caller_id]
         if self.user_call_map.get(receiver_id) == call_id:
             del self.user_call_map[receiver_id]
+
+    def get_language(self, user_id: str) -> str:
+        """
+        Returns the user's language if we have it, else "english".
+        """
+        if user_id in self.active_users:
+            return self.active_users[user_id].language
+        return "en"
+
+    def get_active_users(self):
+        active_users_list = []
+        for user_id, user_object in self.active_users.items():
+            if user_id not in self.user_call_map:
+                active_users_list.append(
+                    {"user_id": user_id, "full_name": user_object.profile_name, "email": user_object.email})
+
+        return active_users_list
+
+    def is_xtts_supported_for_user(self, user_id) -> bool:
+        if user_id in self.active_users:
+            return self.active_users[user_id].is_xtts_supported
+        return False
+
+    def get_user_embeddings_and_gpt_blocks(self, user_id):
+        if user_id in self.active_users:
+            return self.active_users[user_id].embedding, self.active_users[user_id].gpt_cond_latent
+        return None, None
 
 
 manager = ConnectionManager()
@@ -193,7 +295,14 @@ async def end_call(call_id: str, ended_by: str):
     })
 
     # Clean up Redis
-    await expire_call_data(call_id, 120)
+    await expire_call_data(call_id, 30)
+
+    # Flush final transcription for both participants
+    for uid in [caller_id, receiver_id]:
+        key = (call_id, uid)
+        if key in audio_accumulators:
+            audio_accumulators[key].transcribe()  # final flush
+            del audio_accumulators[key]
 
     # Remove call from manager maps
     manager.remove_call(call_id, caller_id, receiver_id)
@@ -224,24 +333,42 @@ class DisconnectCallRequest(BaseModel):
 
 @app.post("/calls/initiate")
 async def initiate_call(request: InitiateCallRequest):
-    if not manager.is_user_online(request.receiver_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Receiver not online."
-        )
+    try:
+        print("Here it is fine1\n")
+        if not manager.is_user_online(request.receiver_id):
+            print("error 1")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Receiver not online."
+            )
 
-    # Create a call_id
-    call_id = str(uuid.uuid4())
-    await create_call_record(call_id, request.caller_id, request.receiver_id)
+        if request.caller_id == request.receiver_id:
+            print("error 2")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You cannot call yourself"
+            )
 
-    # Notify the receiver of an incoming call
-    await manager.send_json(request.receiver_id, {
-        "type": "incoming_call",
-        "call_id": call_id,
-        "from": request.caller_id
-    })
+        print("Here it is fine2\n")
 
-    return JSONResponse({"call_id": call_id, "status": "ringing"})
+        # Create a call_id
+        call_id = str(uuid.uuid4())
+        await create_call_record(call_id, request.caller_id, request.receiver_id)
+
+        print("Here it is fine3\n")
+
+        # Notify the receiver of an incoming call
+        await manager.send_json(request.receiver_id, {
+            "type": "incoming_call",
+            "call_id": call_id,
+            "from": request.caller_id
+        })
+
+        print("Here it is fine4\n")
+
+        return JSONResponse({"call_id": call_id, "status": "ringing"})
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing key: {str(e)}")
 
 
 @app.post("/calls/response")
@@ -257,6 +384,10 @@ async def respond_to_call(request: CallResponseRequest):
     receiver_id = meta["receiver_id"]
 
     if request.response == "accept":
+        # Mark both participants as in this call
+        manager.set_user_call(caller_id, request.call_id)
+        manager.set_user_call(receiver_id, request.call_id)
+
         # Notify caller
         await manager.send_json(caller_id, {
             "type": "call_accepted",
@@ -268,9 +399,7 @@ async def respond_to_call(request: CallResponseRequest):
             "call_id": request.call_id
         })
 
-        # Mark both participants as in this call
-        manager.set_user_call(caller_id, request.call_id)
-        manager.set_user_call(receiver_id, request.call_id)
+        print(f"The caller id is {caller_id}  , and the receiver id is  : {receiver_id}\n")
 
         return JSONResponse({"status": "call_started"})
 
@@ -281,7 +410,7 @@ async def respond_to_call(request: CallResponseRequest):
             "call_id": request.call_id
         })
         # Set TTL to remove call from Redis
-        await expire_call_data(request.call_id, 2)  # short TTL since no call happened
+        await expire_call_data(request.call_id)  # short TTL since no call happened
         return JSONResponse({"status": "call_rejected"})
 
     else:
@@ -315,6 +444,66 @@ async def disconnect_call(request: DisconnectCallRequest):
     return JSONResponse({"status": "call_ended"})
 
 
+# handle first audio send
+@app.post("/process_audio")
+async def process_audio(file: UploadFile = File(...)):
+    """
+        Processes the uploaded audio file and returns conditioning latents
+        and speaker embeddings.
+        """
+
+    # Validate file type
+    if file.content_type != "audio/wav":
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Only 'audio/wav' is supported."
+        )
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+            # Write the uploaded file content to the temporary file
+            tmp_file.write(await file.read())
+            tmp_file_path = tmp_file.name
+
+        # Call the model with the temporary file path
+
+        gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(audio_path=tmp_file_path)
+        speaker_embedding_cpu = speaker_embedding.detach().cpu().numpy()
+        gpt_cond_latent_cpu = gpt_cond_latent.detach().cpu().numpy()
+
+        # 2) Convert NumPy arrays to Python lists
+        embedding_list = speaker_embedding_cpu.tolist()
+        gpt_cond_list = gpt_cond_latent_cpu.tolist()
+
+        embedding_str = json.dumps(embedding_list)
+        gpt_cond_str = json.dumps(gpt_cond_list)
+
+        return JSONResponse(
+            content={"embedding": embedding_str, "gpt_cond_latent": gpt_cond_str}
+        )
+
+    except Exception as e:
+        # Handle exceptions
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing the audio file: {str(e)}"
+        )
+
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(tmp_file_path):
+            os.remove(tmp_file_path)
+
+
+@app.get("/active_users")
+async def active_users():
+    try:
+        users = manager.get_active_users()
+        return JSONResponse(content=users)
+    except Exception as e:
+        return JSONResponse(content={"error": "Failed to fetch active users", "details": str(e)}, status_code=500)
+
+
 # ==========================
 # WebSocket Endpoint
 # ==========================
@@ -323,20 +512,42 @@ class WebSocketConnection(WebSocketEndpoint):
     encoding = None
 
     async def on_connect(self, websocket: StarletteWebSocket):
-        # print(f"WebSocket in connect: {websocket}")
         await websocket.accept()
-        # Expect initial user identification message
         try:
             init_msg = await websocket.receive_json()
-            # print("This is before!")
             if "user_id" not in init_msg:
                 print(init_msg)
                 await websocket.close(code=4000)
                 return
-            # print("it worked!")
+
             self.user_id = init_msg["user_id"]
-            # self.language = init_msg["language"]
-            await manager.connect(self.user_id, websocket)
+            # Provide defaults or read from init_msg
+            language = init_msg.get("language", "en")
+            profile_name = init_msg.get("profile_name", "")
+            email = init_msg.get("email", "")
+            embedding = init_msg.get("embedding", None)
+            gpt_cond_latent = init_msg.get("gpt_cond_latent", None)
+            print(f"Here are the values!!, {embedding} \n")
+            print(gpt_cond_latent)
+
+            if embedding and isinstance(embedding, str):
+                embedding_list = json.loads(embedding)
+                embedding = torch.tensor(embedding_list, dtype=torch.float32)
+
+            if gpt_cond_latent and isinstance(gpt_cond_latent, str):
+                latent_list = json.loads(gpt_cond_latent)
+                gpt_cond_latent = torch.tensor(latent_list, dtype=torch.float32)
+
+            await manager.connect(
+                user_id=self.user_id,
+                websocket=websocket,
+                language=language,
+                profile_name=profile_name,
+                email=email,
+                embedding=embedding,
+                gpt_cond_latent=gpt_cond_latent
+            )
+
         except Exception:
             await websocket.close(code=4001)
             return
@@ -364,7 +575,12 @@ class WebSocketConnection(WebSocketEndpoint):
             )
             if not valid_seq:
                 await websocket.send_json({"error": "Invalid sequence number"})
+                print("error: Invalid sequence number")
                 return
+
+            # test_var = int(parsed_data["seq_num"])
+
+            # print(f"Server Received Json from called id {self.user_id} with sequence number of : {test_var}")
 
             self.current_metadata = parsed_data
 
@@ -378,31 +594,127 @@ class WebSocketConnection(WebSocketEndpoint):
         else:
             print("recieved something non familiar, doing nothing !!!!\n")
 
-
     async def on_receive_binary(self, data: bytes):
         meta = self.current_metadata
         call_id = meta["call_id"]
         seq_num = int(meta["seq_num"])
+
+        # print(f"Server Received Bytes from called id {self.user_id} with sequence number of : {seq_num}")
 
         # await store_audio_chunk(call_id, self.user_id, data)
         await increment_sequence_number(call_id, self.user_id)
 
         # Forward the chunk to the other participant
         call_meta = await get_call_metadata(call_id)
-        if call_meta:
-            caller_id = call_meta["caller_id"]
-            receiver_id = call_meta["receiver_id"]
-            other_user = receiver_id if caller_id == self.user_id else caller_id
 
+        if not call_meta:
+            print("No call metadata found, cannot forward")
+            return
+
+        caller_id = call_meta["caller_id"]
+        receiver_id = call_meta["receiver_id"]
+        other_user = receiver_id if caller_id == self.user_id else caller_id
+
+        other_user_language = manager.get_language(other_user)
+        my_language = manager.get_language(self.user_id)
+
+        if other_user_language.lower() == my_language.lower():
+            # Send metadata
             outgoing_metadata = {
                 "call_id": call_id,
                 "seq_num": seq_num,
                 "sample_rate": 16000,
                 "chunk_size": len(data)
             }
-
             await manager.send_json(other_user, outgoing_metadata)
             await manager.send_bytes(other_user, data)
+
+        else:
+            # Different language => Accumulate and possibly do Whisper -> Translate -> TTS
+            key = (call_id, self.user_id)
+            if key not in audio_accumulators_locks:
+                audio_accumulators_locks[key] = Lock()
+            lock = audio_accumulators_locks[key]
+            async with lock:
+                #  create AudioAccumulator
+                if key not in audio_accumulators:
+                    audio_accumulators[key] = AudioAccumulator(
+                        sample_rate=16000,
+                        sample_width=2,
+                        channels=1,
+                        threshold_bytes=50 * 1024,  # 50 KB
+                        time_threshold=5
+                    )
+
+                # Add chunk
+                ready_to_process = audio_accumulators[key].add_chunk(data)
+
+                if ready_to_process:
+                    # Flush the accumulator
+                    pcm_to_process = audio_accumulators[key].flush()
+
+            # If it's NOT time to process yet, lets do nothing more.
+            # The user only hears TTS after threshold is reached or 5s pass or the message size is bigger than 50 KB.
+            if ready_to_process:
+
+                # 2) Transcribe
+                whisper_api = Whisper(
+                    source_language=my_language,
+                    destination_language=other_user_language
+                )
+                text = whisper_api.transcribe_from_pcm(pcm_to_process)
+                if len(text) <= 1:
+                    print("Failed Translation too small in whisper")
+                    return
+                print("Whsiper Done")
+
+                # 3) Translate (if needed)
+                translator = ChatGpt(my_language, other_user_language)
+                translated_text = translator.translate_text(text)
+                print(f"Chatgpt done with this :::  {translated_text}")
+                # print("This is before TTS")
+                tts_api = TTS(my_language, other_user_language)
+                pcm_16k = tts_api.text_to_speech(translated_text)
+
+
+                """
+                Lets first check if the langauge of the user is supported in xtts and if we have the embeddings
+                
+                """
+
+                # if manager.is_xtts_supported_for_user(receiver_id):
+                #     speakers_embeddings, gpt_blocks = manager.get_user_embeddings_and_gpt_blocks(call_id)
+                #     xtts_outputs = model.inference(
+                #         text=translated_text,
+                #         gpt_cond_latent=gpt_blocks,
+                #         speaker_embedding=speakers_embeddings,
+                #         language=manager.get_language(receiver_id)
+                #     )
+                #     wav_data = xtts_outputs["wav"]  # This should be a WAV in bytes form
+                #
+                #     # 2) Load into pydub's AudioSegment
+                #     audio_segment = AudioSegment.from_file(io.BytesIO(wav_data), format="wav")
+                #
+                #     # 3) Convert to mono and resample from 24 kHz to 16 kHz
+                #     audio_mono_16k = (
+                #         audio_segment
+                #             .set_channels(1)  # force mono
+                #             .set_frame_rate(16000)  # resample to 16 kHz
+                #             .set_sample_width(2)  # ensure 16-bit = 2 bytes per sample
+                #     )
+                #
+                #     # 4) Extract raw PCM bytes
+                #     pcm_16k = audio_mono_16k.raw_data
+
+                outgoing_metadata = {
+                    "call_id": call_id,
+                    "seq_num": seq_num,
+                    "sample_rate": 16000,
+                    "chunk_size": len(pcm_16k)
+                }
+                # print("We have reached this point!!")
+                await manager.send_json(other_user, outgoing_metadata)
+                await manager.send_bytes(other_user, pcm_16k)
 
         self.current_metadata = None
 
@@ -437,11 +749,11 @@ async def shutdown_event():
     if redis_pool:
         await redis_pool.close()
 
-
 # ================================
 # Run the app (For testing only)
 # ================================
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+#
+# if __name__ == "__main__":
+#     import uvicorn
+#
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
