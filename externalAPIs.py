@@ -6,16 +6,21 @@ import io
 import time
 from gtts import gTTS
 
-import openai
+from openai import AsyncOpenAI
 from pydub import AudioSegment
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
-if not openai.api_key:
+# openai.api_key = os.getenv("OPENAI_API_KEY")
+# if not openai.api_key:
+#     print("Could not get the openAI Key")
+# openai.organization = "org-5br2wVBrYCC6OVpITG4awGDl"
+key = os.getenv("OPENAI_API_KEY")
+if not key:
     print("Could not get the openAI Key")
-openai.organization = "org-5br2wVBrYCC6OVpITG4awGDl"
+client = AsyncOpenAI(api_key=key)
+client.organization = "org-5br2wVBrYCC6OVpITG4awGDl"
 
 
 class Whisper:
@@ -32,14 +37,14 @@ class Whisper:
         self.sample_width = sample_width
         self.channels = channels
 
-    def transcribe_from_pcm(self, pcm_data: bytes) -> str:
+    async def transcribe_from_pcm(self, pcm_data: bytes) -> str:
         """
         Convert raw PCM to a temp WAV, send to OpenAI Whisper, return transcribed text.
         """
         if not pcm_data:
             return ""
 
-        start_time = time.time()
+        # start_time = time.time()
 
         # Convert PCM to WAV using pydub
         audio_segment = AudioSegment(
@@ -57,21 +62,21 @@ class Whisper:
             # import openai
             with open(tmp_path, "rb") as f:
                 if self.destination_language.lower() == "en":
-                    transcription = openai.audio.translations.create(
+                    transcription = await client.audio.translations.create(
                         model="whisper-1",
                         file=f
 
                     )
                 else:
                     # Use normal transcription
-                    transcription = openai.audio.transcriptions.create(
+                    transcription = await client.audio.transcriptions.create(
                         model="whisper-1",
                         file=f,
                         language=self.source_language
                     )
-            duration = time.time() - start_time
-            print(f"[TTS] Time taken: {duration:.2f} seconds")
-            print(transcription.text)
+            # duration = time.time() - start_time
+            # print(f"[Whisper] Time taken: {duration:.2f} seconds")
+            # print(transcription.text)
             return transcription.text or ""
 
         except Exception as e:
@@ -90,15 +95,15 @@ class ChatGpt:
         self.source_language = source_language
         self.destination_language = destination_language
 
-    def translate_text(self, text: str):
+    async def translate_text(self, text: str):
         if not text:
             return ""
-        start_time = time.time()
+        # start_time = time.time()
         if self.destination_language.lower() == 'en':
             return text
 
         try:
-            completion = openai.chat.completions.create(
+            completion = await client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "assistant", "content": f"You are a helpful translator"},
@@ -108,9 +113,9 @@ class ChatGpt:
                     }
                 ]
             )
-            duration = time.time() - start_time
-            print(f"[ChatGPT] Time taken: {duration:.2f} seconds")
-            print(completion.choices[0].message)
+            # duration = time.time() - start_time
+            # print(f"[ChatGPT] Time taken: {duration:.2f} seconds")
+            # print(completion.choices[0].message)
             return completion.choices[0].message.content.strip()
 
         except Exception as e:
@@ -130,7 +135,7 @@ class TTS:
         self.source_language = source_language
         self.destination_language = destination_language
 
-    def text_to_speech(self, text: str) -> bytes:
+    async def text_to_speech(self, text: str) -> bytes:
         """
         Use the OpenAI TTS endpoint, write to a temp .mp3 file, load into pydub,
         resample to 16 kHz mono, and return raw PCM data.
@@ -138,15 +143,11 @@ class TTS:
         if not text:
             return b""
 
-        start_time = time.time()
-
-        # 1) Create a temporary filename on disk (closed, so we can re-open it below)
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_file:
-            tmp_mp3_path = tmp_file.name
+        # start_time = time.time()
 
         try:
             # 2) Stream TTS audio from OpenAI to the temp file
-            response = openai.audio.speech.create(
+            response = await client.audio.speech.create(
                 model="tts-1",
                 voice="echo",
                 input=text,
@@ -164,8 +165,8 @@ class TTS:
             )
 
             audio_16k = audio.set_frame_rate(16000)
-            duration = time.time() - start_time
-            print(f"[TTS] Time taken: {duration:.2f} seconds")
+            # duration = time.time() - start_time
+            # print(f"[TTS] Time taken: {duration:.2f} seconds")
             return audio_16k.raw_data
         except Exception as e:
             print(f"[TTS Error] {e}")

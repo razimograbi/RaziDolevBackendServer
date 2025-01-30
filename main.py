@@ -1,6 +1,6 @@
 # import asyncio
 # uvicorn main:app --host 0.0.0.0 --port 8000 --env-file environment.env
-import json
+# import json
 import time
 import json
 import uuid
@@ -8,32 +8,34 @@ from typing import Optional, Dict, Any
 from asyncio import Lock
 
 import aioredis
-from fastapi import FastAPI, WebSocket, File, UploadFile, WebSocketDisconnect, HTTPException, status, Body
+from fastapi import FastAPI, WebSocket, File, UploadFile, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.endpoints import WebSocketEndpoint
 from starlette.websockets import WebSocket as StarletteWebSocket
-from starlette.routing import Route, WebSocketRoute
+from starlette.routing import WebSocketRoute
 from starlette.middleware.cors import CORSMiddleware
 from audioAccumulator import AudioAccumulator
 from externalAPIs import Whisper, ChatGpt, TTS
 import io
-from pydub import AudioSegment
+import base64
+# from pydub import AudioSegment
 
-# from TTS.tts.configs.xtts_config import XttsConfig
-# from TTS.tts.models.xtts import Xtts
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
 import tempfile
 
-# import numpy as np
-
-"""
-This is for testing
-
-"""
 import torch
+config = XttsConfig()
+config.load_json("./XTTS_Packages/XTTS-v2/config.json")
 #
-print(torch.cuda.is_available())  # Should return True if GPU is detected
+model = Xtts.init_from_config(config)
+model.load_checkpoint(config, checkpoint_dir="./XTTS_Packages/XTTS-v2/")
+model.cpu()  # we will use  model.cpu() bec the device has a weak GPU
 
+#
+# print(torch.cuda.is_available())  # Should return True if GPU is detected
+#
 # config = XttsConfig()
 # config.load_json("./XTTS_Packages/XTTS-v2/config.json")
 #
@@ -57,6 +59,10 @@ REDIS_URL = "redis://localhost:6379"
 redis_pool = None
 audio_accumulators = {}
 audio_accumulators_locks = {}
+ended_calls_ids = set()
+MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10MB
+IS_DEVELOPMENT = True
+DEVICE = "cpu" if IS_DEVELOPMENT else "cuda"
 
 app = FastAPI()
 
@@ -97,11 +103,12 @@ class ConnectionManager:
         """
             If user_id already connected, close the old connection and replace it.
         """
+
         if user_id in self.active_users:
             old_user = self.active_users[user_id]
             # await old_user.websocket.close()
             old_user.websocket = websocket
-            print(" I am here\n")
+            # print(" I am here\n")
             return
 
         user = User(
@@ -280,6 +287,7 @@ async def end_call(call_id: str, ended_by: str):
         return  # Call not found, nothing to do.
     caller_id = meta["caller_id"]
     receiver_id = meta["receiver_id"]
+    ended_calls_ids.add(call_id)
 
     # Determine other participant
     if ended_by == caller_id:
@@ -295,13 +303,13 @@ async def end_call(call_id: str, ended_by: str):
     })
 
     # Clean up Redis
-    await expire_call_data(call_id, 30)
+    await expire_call_data(call_id, 10)
 
     # Flush final transcription for both participants
     for uid in [caller_id, receiver_id]:
         key = (call_id, uid)
         if key in audio_accumulators:
-            audio_accumulators[key].transcribe()  # final flush
+            audio_accumulators[key].flush()  # final flush
             del audio_accumulators[key]
 
     # Remove call from manager maps
@@ -334,7 +342,9 @@ class DisconnectCallRequest(BaseModel):
 @app.post("/calls/initiate")
 async def initiate_call(request: InitiateCallRequest):
     try:
-        print("Here it is fine1\n")
+        # print("Here it is fine1\n")
+
+
         if not manager.is_user_online(request.receiver_id):
             print("error 1")
             raise HTTPException(
@@ -349,13 +359,13 @@ async def initiate_call(request: InitiateCallRequest):
                 detail="You cannot call yourself"
             )
 
-        print("Here it is fine2\n")
+        # print("Here it is fine2\n")
 
         # Create a call_id
         call_id = str(uuid.uuid4())
         await create_call_record(call_id, request.caller_id, request.receiver_id)
 
-        print("Here it is fine3\n")
+        # print("Here it is fine3\n")
 
         # Notify the receiver of an incoming call
         await manager.send_json(request.receiver_id, {
@@ -364,7 +374,7 @@ async def initiate_call(request: InitiateCallRequest):
             "from": request.caller_id
         })
 
-        print("Here it is fine4\n")
+        # print("Here it is fine4\n")
 
         return JSONResponse({"call_id": call_id, "status": "ringing"})
     except KeyError as e:
@@ -451,6 +461,8 @@ async def process_audio(file: UploadFile = File(...)):
         Processes the uploaded audio file and returns conditioning latents
         and speaker embeddings.
         """
+    if file.size > MAX_AUDIO_SIZE:
+        raise HTTPException(413, "File too large")
 
     # Validate file type
     if file.content_type != "audio/wav":
@@ -460,23 +472,25 @@ async def process_audio(file: UploadFile = File(...)):
         )
 
     try:
+        # ******************************************************************************************
+        # ********************** This should be changed only here for testing **********************
+        # ******************************************************************************************
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
             # Write the uploaded file content to the temporary file
             tmp_file.write(await file.read())
             tmp_file_path = tmp_file.name
 
-        # Call the model with the temporary file path
-
         gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(audio_path=tmp_file_path)
-        speaker_embedding_cpu = speaker_embedding.detach().cpu().numpy()
-        gpt_cond_latent_cpu = gpt_cond_latent.detach().cpu().numpy()
 
-        # 2) Convert NumPy arrays to Python lists
-        embedding_list = speaker_embedding_cpu.tolist()
-        gpt_cond_list = gpt_cond_latent_cpu.tolist()
+        def serialize_tensor(tensor: torch.Tensor) -> str:
+            """Serialize tensor to base64 string without moving to CPU"""
+            buffer = io.BytesIO()
+            torch.save(tensor, buffer)
+            return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
-        embedding_str = json.dumps(embedding_list)
-        gpt_cond_str = json.dumps(gpt_cond_list)
+        embedding_str = serialize_tensor(speaker_embedding)
+        gpt_cond_str = serialize_tensor(gpt_cond_latent)
 
         return JSONResponse(
             content={"embedding": embedding_str, "gpt_cond_latent": gpt_cond_str}
@@ -504,9 +518,18 @@ async def active_users():
         return JSONResponse(content={"error": "Failed to fetch active users", "details": str(e)}, status_code=500)
 
 
+
+# ==========================
+# Tensor helper method
+# ==========================
+def deserialize_tensor(encoded_str: str) -> torch.Tensor:
+    buffer = io.BytesIO(base64.b64decode(encoded_str))
+    return torch.load(buffer, map_location=DEVICE)
+
 # ==========================
 # WebSocket Endpoint
 # ==========================
+
 
 class WebSocketConnection(WebSocketEndpoint):
     encoding = None
@@ -531,12 +554,10 @@ class WebSocketConnection(WebSocketEndpoint):
             print(gpt_cond_latent)
 
             if embedding and isinstance(embedding, str):
-                embedding_list = json.loads(embedding)
-                embedding = torch.tensor(embedding_list, dtype=torch.float32)
+                embedding = deserialize_tensor(embedding)
 
             if gpt_cond_latent and isinstance(gpt_cond_latent, str):
-                latent_list = json.loads(gpt_cond_latent)
-                gpt_cond_latent = torch.tensor(latent_list, dtype=torch.float32)
+                gpt_cond_latent = deserialize_tensor(gpt_cond_latent)
 
             await manager.connect(
                 user_id=self.user_id,
@@ -598,6 +619,8 @@ class WebSocketConnection(WebSocketEndpoint):
         meta = self.current_metadata
         call_id = meta["call_id"]
         seq_num = int(meta["seq_num"])
+        if call_id in ended_calls_ids:
+            return
 
         # print(f"Server Received Bytes from called id {self.user_id} with sequence number of : {seq_num}")
 
@@ -626,6 +649,8 @@ class WebSocketConnection(WebSocketEndpoint):
                 "sample_rate": 16000,
                 "chunk_size": len(data)
             }
+            if call_id in ended_calls_ids:
+                return
             await manager.send_json(other_user, outgoing_metadata)
             await manager.send_bytes(other_user, data)
 
@@ -642,8 +667,8 @@ class WebSocketConnection(WebSocketEndpoint):
                         sample_rate=16000,
                         sample_width=2,
                         channels=1,
-                        threshold_bytes=50 * 1024,  # 50 KB
-                        time_threshold=5
+                        threshold_bytes=100 * 1024,  # 50 KB
+                        time_threshold=6
                     )
 
                 # Add chunk
@@ -662,19 +687,19 @@ class WebSocketConnection(WebSocketEndpoint):
                     source_language=my_language,
                     destination_language=other_user_language
                 )
-                text = whisper_api.transcribe_from_pcm(pcm_to_process)
+                text = await whisper_api.transcribe_from_pcm(pcm_to_process)
                 if len(text) <= 1:
                     print("Failed Translation too small in whisper")
                     return
-                print("Whsiper Done")
+                # print("Whsiper Done")
 
                 # 3) Translate (if needed)
                 translator = ChatGpt(my_language, other_user_language)
-                translated_text = translator.translate_text(text)
-                print(f"Chatgpt done with this :::  {translated_text}")
+                translated_text = await translator.translate_text(text)
+                # print(f"Chatgpt done with this :::  {translated_text}")
                 # print("This is before TTS")
                 tts_api = TTS(my_language, other_user_language)
-                pcm_16k = tts_api.text_to_speech(translated_text)
+                pcm_16k = await tts_api.text_to_speech(translated_text)
 
 
                 """
@@ -713,6 +738,8 @@ class WebSocketConnection(WebSocketEndpoint):
                     "chunk_size": len(pcm_16k)
                 }
                 # print("We have reached this point!!")
+                if call_id in ended_calls_ids:
+                    return
                 await manager.send_json(other_user, outgoing_metadata)
                 await manager.send_bytes(other_user, pcm_16k)
 
@@ -753,7 +780,7 @@ async def shutdown_event():
 # Run the app (For testing only)
 # ================================
 #
-# if __name__ == "__main__":
-#     import uvicorn
-#
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
