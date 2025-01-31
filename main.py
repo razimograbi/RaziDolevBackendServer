@@ -7,7 +7,7 @@ import uuid
 from typing import Optional, Dict, Any
 from asyncio import Lock
 
-import aioredis
+import redis.asyncio as aioredis
 from fastapi import FastAPI, WebSocket, File, UploadFile, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
