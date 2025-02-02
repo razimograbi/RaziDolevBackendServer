@@ -100,6 +100,7 @@ class ChatGpt:
             return ""
         # start_time = time.time()
         if self.destination_language.lower() == 'en':
+            print("Skipped The API Call of ChatGPT")
             return text
 
         try:

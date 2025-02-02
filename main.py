@@ -19,12 +19,13 @@ from audioAccumulator import AudioAccumulator
 from externalAPIs import Whisper, ChatGpt, TTS
 import io
 import base64
-# from pydub import AudioSegment
+from pydub import AudioSegment
+from scipy.io.wavfile import write
 
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 import tempfile
-
+import asyncio
 import torch
 config = XttsConfig()
 config.load_json("./XTTS_Packages/XTTS-v2/config.json")
@@ -103,13 +104,21 @@ class ConnectionManager:
         """
             If user_id already connected, close the old connection and replace it.
         """
-
+        # time.sleep(100)
+        # print("why am I not reaching this point!!")
         if user_id in self.active_users:
             old_user = self.active_users[user_id]
             # await old_user.websocket.close()
             old_user.websocket = websocket
-            # print(" I am here\n")
+            if self.active_users[user_id].gpt_cond_latent is None:
+                print("This is a bug!!!")
+            print(" I am here\n")
             return
+
+        if gpt_cond_latent is None:
+            print("I am in connect and it is not working!!!")
+
+        print("Create user")
 
         user = User(
             websocket=websocket,
@@ -121,6 +130,7 @@ class ConnectionManager:
             gpt_cond_latent=gpt_cond_latent
         )
         self.active_users[user_id] = user
+        print(f'Currently connected is {user_id} with profile name {profile_name}')
 
     def disconnect(self, user_id: str):
         """
@@ -343,8 +353,6 @@ class DisconnectCallRequest(BaseModel):
 async def initiate_call(request: InitiateCallRequest):
     try:
         # print("Here it is fine1\n")
-
-
         if not manager.is_user_online(request.receiver_id):
             print("error 1")
             raise HTTPException(
@@ -513,6 +521,7 @@ async def process_audio(file: UploadFile = File(...)):
 async def active_users():
     try:
         users = manager.get_active_users()
+        print(users)
         return JSONResponse(content=users)
     except Exception as e:
         return JSONResponse(content={"error": "Failed to fetch active users", "details": str(e)}, status_code=500)
@@ -524,7 +533,7 @@ async def active_users():
 # ==========================
 def deserialize_tensor(encoded_str: str) -> torch.Tensor:
     buffer = io.BytesIO(base64.b64decode(encoded_str))
-    return torch.load(buffer, map_location=DEVICE)
+    return torch.load(buffer, map_location=DEVICE, weights_only=True)
 
 # ==========================
 # WebSocket Endpoint
@@ -536,10 +545,12 @@ class WebSocketConnection(WebSocketEndpoint):
 
     async def on_connect(self, websocket: StarletteWebSocket):
         await websocket.accept()
+        self.websocket = websocket
+        self.keep_alive_task = asyncio.create_task(self.keep_alive())
         try:
             init_msg = await websocket.receive_json()
             if "user_id" not in init_msg:
-                print(init_msg)
+                print("THis is a bug!, Iamhere")
                 await websocket.close(code=4000)
                 return
 
@@ -550,14 +561,19 @@ class WebSocketConnection(WebSocketEndpoint):
             email = init_msg.get("email", "")
             embedding = init_msg.get("embedding", None)
             gpt_cond_latent = init_msg.get("gpt_cond_latent", None)
-            print(f"Here are the values!!, {embedding} \n")
-            print(gpt_cond_latent)
+            if gpt_cond_latent is None:
+                print("In the connect the gpt blocks are None")
+            else:
+                print("gpt block is not None")
 
             if embedding and isinstance(embedding, str):
                 embedding = deserialize_tensor(embedding)
 
             if gpt_cond_latent and isinstance(gpt_cond_latent, str):
                 gpt_cond_latent = deserialize_tensor(gpt_cond_latent)
+
+            if gpt_cond_latent is None:
+                print("In connect the gpt blocks are still None")
 
             await manager.connect(
                 user_id=self.user_id,
@@ -667,16 +683,16 @@ class WebSocketConnection(WebSocketEndpoint):
                         sample_rate=16000,
                         sample_width=2,
                         channels=1,
-                        threshold_bytes=100 * 1024,  # 50 KB
+                        threshold_bytes=150 * 1024,  # 150 KB
                         time_threshold=6
                     )
 
                 # Add chunk
-                ready_to_process = audio_accumulators[key].add_chunk(data)
+                ready_to_process = await audio_accumulators[key].add_chunk(data)
 
                 if ready_to_process:
                     # Flush the accumulator
-                    pcm_to_process = audio_accumulators[key].flush()
+                    pcm_to_process = await audio_accumulators[key].flush()
 
             # If it's NOT time to process yet, lets do nothing more.
             # The user only hears TTS after threshold is reached or 5s pass or the message size is bigger than 50 KB.
@@ -696,40 +712,38 @@ class WebSocketConnection(WebSocketEndpoint):
                 # 3) Translate (if needed)
                 translator = ChatGpt(my_language, other_user_language)
                 translated_text = await translator.translate_text(text)
-                # print(f"Chatgpt done with this :::  {translated_text}")
+                print(f"Chatgpt done with this :::  {translated_text}")
                 # print("This is before TTS")
-                tts_api = TTS(my_language, other_user_language)
-                pcm_16k = await tts_api.text_to_speech(translated_text)
-
 
                 """
                 Lets first check if the langauge of the user is supported in xtts and if we have the embeddings
                 
                 """
+                if manager.is_xtts_supported_for_user(other_user):
+                    speakers_embeddings, gpt_blocks = manager.get_user_embeddings_and_gpt_blocks(self.user_id)
+                    xtts_outputs = model.inference(
+                        text=translated_text,
+                        gpt_cond_latent=gpt_blocks,
+                        speaker_embedding=speakers_embeddings,
+                        language=manager.get_language(other_user)
+                    )
+                    temp_wav_path = "temp_24k.wav"
+                    write(temp_wav_path, 24000, xtts_outputs["wav"])
+                    audio_24k = AudioSegment.from_wav(temp_wav_path)
+                    audio_16k = (
+                        audio_24k
+                            .set_frame_rate(16000)
+                            .set_channels(1)
+                            .set_sample_width(2)  # 16-bit
+                    )
+                    pcm_16k = audio_16k.raw_data
 
-                # if manager.is_xtts_supported_for_user(receiver_id):
-                #     speakers_embeddings, gpt_blocks = manager.get_user_embeddings_and_gpt_blocks(call_id)
-                #     xtts_outputs = model.inference(
-                #         text=translated_text,
-                #         gpt_cond_latent=gpt_blocks,
-                #         speaker_embedding=speakers_embeddings,
-                #         language=manager.get_language(receiver_id)
-                #     )
-                #     wav_data = xtts_outputs["wav"]  # This should be a WAV in bytes form
-                #
-                #     # 2) Load into pydub's AudioSegment
-                #     audio_segment = AudioSegment.from_file(io.BytesIO(wav_data), format="wav")
-                #
-                #     # 3) Convert to mono and resample from 24 kHz to 16 kHz
-                #     audio_mono_16k = (
-                #         audio_segment
-                #             .set_channels(1)  # force mono
-                #             .set_frame_rate(16000)  # resample to 16 kHz
-                #             .set_sample_width(2)  # ensure 16-bit = 2 bytes per sample
-                #     )
-                #
-                #     # 4) Extract raw PCM bytes
-                #     pcm_16k = audio_mono_16k.raw_data
+                    if os.path.exists(temp_wav_path):
+                        os.remove(temp_wav_path)
+                else:
+                    print("We are inside the else")
+                    tts_api = TTS(my_language, other_user_language)
+                    pcm_16k = await tts_api.text_to_speech(translated_text)
 
                 outgoing_metadata = {
                     "call_id": call_id,
@@ -745,6 +759,15 @@ class WebSocketConnection(WebSocketEndpoint):
 
         self.current_metadata = None
 
+    async def keep_alive(self):
+        """ Periodically send a ping message to keep the connection alive """
+        try:
+            while True:
+                await asyncio.sleep(30)  # Send a ping every 30 seconds
+                await self.websocket.send_json({"type": "ping"})  # Send a ping message
+        except Exception as e:
+            print(f"WebSocket keep-alive error: {e}")
+
     async def on_disconnect(self, websocket: StarletteWebSocket, close_code: int):
         # If user is in a call, end it
         if hasattr(self, 'user_id') and self.user_id in manager.user_call_map:
@@ -752,6 +775,8 @@ class WebSocketConnection(WebSocketEndpoint):
             if call_id:
                 # This user disconnected abruptly, end the call
                 await end_call(call_id, ended_by=self.user_id)
+        if hasattr(self, "keep_alive_task"):
+            self.keep_alive_task.cancel()
         manager.disconnect(self.user_id)
 
 
