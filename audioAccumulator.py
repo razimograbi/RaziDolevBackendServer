@@ -1,10 +1,10 @@
+import asyncio
 import time
-import threading
 
 class AudioAccumulator:
     """
-    Thread-safe Accumulates raw PCM data for a participant until
-    either threshold_bytes or time_threshold is reached.
+    Asynchronous version of AudioAccumulator using asyncio.Lock.
+    Accumulates raw PCM data until threshold_bytes or time_threshold is reached.
     """
 
     def __init__(
@@ -12,7 +12,7 @@ class AudioAccumulator:
         sample_rate=16000,
         sample_width=2,
         channels=1,
-        threshold_bytes=50 * 1024,  # 15 KB
+        threshold_bytes=50 * 1024,  # 50 KB
         time_threshold=5             # 5 seconds
     ):
         self.sample_rate = sample_rate
@@ -24,37 +24,37 @@ class AudioAccumulator:
         self.time_threshold = time_threshold
 
         self.last_transcribe_time = time.time()
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()  # Async Lock
 
-    def add_chunk(self, pcm_data: bytes) -> bool:
+    async def add_chunk(self, pcm_data: bytes) -> bool:
         """
-        Thread-safe chunk addition with combined size/time check.
-        Returns True if processing threshold is met.
+        Asynchronously adds a chunk of PCM data.
+        Returns True if threshold (size or time) is reached.
         """
-        with self.lock:
-            # Atomic modification of buffer and timestamp
+        async with self.lock:  # Use async lock
             self.chunks.extend(pcm_data)
             current_time = time.time()
 
-            # Check thresholds while holding the lock
+            # Check thresholds
             size_met = len(self.chunks) >= self.threshold_bytes
             time_met = (current_time - self.last_transcribe_time) >= self.time_threshold
 
             return size_met or time_met
 
-    def flush(self) -> bytes:
+    async def flush(self) -> bytes:
         """
-        Atomically retrieves and resets the buffer with lock protection.
-        Returns empty bytes if called concurrently.
+        Asynchronously retrieves and clears the buffer with async lock protection.
+        Returns the accumulated data.
         """
-        with self.lock:
-            data = bytes(self.chunks)
-            self.chunks.clear()
-            self.last_transcribe_time = time.time()
+        async with self.lock:
+            data = bytes(self.chunks)  # Copy buffer
+            self.chunks.clear()  # Clear buffer
+            self.last_transcribe_time = time.time()  # Update timestamp
             return data
 
     @property
-    def current_size(self) -> int:
-        """Thread-safe buffer size check"""
-        with self.lock:
+    async def current_size(self) -> int:
+        """Asynchronously returns buffer size."""
+        async with self.lock:
             return len(self.chunks)
+
