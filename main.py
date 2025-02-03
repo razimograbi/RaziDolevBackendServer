@@ -159,6 +159,11 @@ class ConnectionManager:
         # print(self.active_users)
         return user_id in self.active_users
 
+    def get_user_email(self, user_id: str) -> str:
+        if user_id in self.active_users:
+            return self.active_users[user_id].email
+        return ""
+
     def set_user_call(self, user_id: str, call_id: str):
         self.user_call_map[user_id] = call_id
 
@@ -374,12 +379,15 @@ async def initiate_call(request: InitiateCallRequest):
         await create_call_record(call_id, request.caller_id, request.receiver_id)
 
         # print("Here it is fine3\n")
+        caller_user_email = manager.get_user_email(request.caller_id)
+        if not caller_user_email:
+            caller_user_email = request.caller_id
 
         # Notify the receiver of an incoming call
         await manager.send_json(request.receiver_id, {
             "type": "incoming_call",
             "call_id": call_id,
-            "from": request.caller_id
+            "from": caller_user_email
         })
 
         # print("Here it is fine4\n")
